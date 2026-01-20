@@ -1,0 +1,8 @@
+pandas
+requests
+matplotlib
+numpy
+ipywidgets
+ipython
+tqdm
+python-dotenv
