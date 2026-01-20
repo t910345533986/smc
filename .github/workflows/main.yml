@@ -1,0 +1,164 @@
+import pandas as pd
+import requests
+import matplotlib.pyplot as plt
+import numpy as np
+import warnings
+import io
+import time
+import os
+import sys
+from tqdm import tqdm
+
+# 從 GitHub Secrets 讀取網址
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+warnings.filterwarnings("ignore")
+
+class BingXStructureHunterV37:
+    def __init__(self):
+        self.targets = []
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+
+    def send_discord_report(self, content):
+        if not DISCORD_WEBHOOK_URL: return
+        try: requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
+        except: pass
+
+    def upload_plot_to_discord(self, fig, symbol, sig_type):
+        if not DISCORD_WEBHOOK_URL: return
+        try:
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor())
+            buf.seek(0)
+            payload = {"content": f"🎯 **{symbol}** 獵殺信號觸發！ ({sig_type})"}
+            files = {"file": (f"{symbol}_analysis.png", buf, "image/png")}
+            requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files, timeout=15)
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"Discord 上傳失敗: {e}")
+
+    def get_bingx_symbols(self, count):
+        try:
+            url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+            r = self.session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data['code'] == 0:
+                    all_pairs = [item['symbol'] for item in data['data'] if 'USDT' in item['symbol']]
+                    self.targets = sorted(all_pairs)[:count]
+                    return True
+            return False
+        except: return False
+
+    def fetch_data_stable(self, symbol, interval):
+        cb_symbol = symbol.replace('USDT', 'USD')
+        granularity_map = {'1h': 3600}
+        url = f"https://api.exchange.coinbase.com/products/{cb_symbol}/candles"
+        try:
+            r = self.session.get(url, params={'granularity': 3600}, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                df = pd.DataFrame(data, columns=['Time', 'L', 'H', 'O', 'C', 'V'])
+                df['Time'] = pd.to_datetime(df['Time'], unit='s').dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
+                df = df.sort_values('Time').reset_index(drop=True)
+                df[['O', 'H', 'L', 'C', 'V']] = df[['O', 'H', 'L', 'C', 'V']].astype(float)
+                return df
+        except: return None
+
+    def fetch_liquidation_data(self, symbol):
+        clean_symbol = symbol.replace("-", "").upper()
+        url = "https://fapi.binance.com/fapi/v1/forceOrders"
+        try:
+            r = self.session.get(url, params={"symbol": clean_symbol, "limit": 100}, timeout=5)
+            if r.status_code == 200 and r.json():
+                df_liq = pd.DataFrame(r.json())
+                df_liq['time'] = pd.to_datetime(df_liq['time'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
+                df_liq['vol'] = df_liq['price'].astype(float) * df_liq['origQty'].astype(float)
+                return df_liq
+            return None
+        except: return None
+
+    def find_swing_points(self, df, lookback):
+        highs, lows = [], []
+        if len(df) < lookback * 2 + 1: return [], []
+        h_vals, l_vals = df['H'].values, df['L'].values
+        last_idx = len(df) - 1
+        for i in range(lookback, len(df) - lookback):
+            if h_vals[i] == h_vals[i-lookback : i+lookback+1].max():
+                highs.append({'index': i, 'price': h_vals[i], 'time': df['Time'].iloc[i], 'expiry': last_idx})
+            if l_vals[i] == l_vals[i-lookback : i+lookback+1].min():
+                lows.append({'index': i, 'price': l_vals[i], 'time': df['Time'].iloc[i], 'expiry': last_idx})
+        return highs, lows
+
+    def process_liquidity_logic(self, df, highs, lows):
+        sigs = []
+        for i in range(1, len(df) - 1):
+            curr, nxt = df.iloc[i], df.iloc[i+1]
+            for h in highs:
+                if h['index'] < i and i <= h['expiry']:
+                    if curr['H'] > h['price'] and curr['C'] <= h['price']:
+                        sigs.append({'時間': curr['Time'], '信號': '看空獵殺', '結構價': h['price'], '確認': "✅ 已確認" if nxt['C'] < curr['C'] else "⏳ 待確認"})
+                        h['expiry'] = i
+            for l in lows:
+                if l['index'] < i and i <= l['expiry']:
+                    if curr['L'] < l['price'] and curr['C'] >= l['price']:
+                        sigs.append({'時間': curr['Time'], '信號': '看多獵殺', '結構價': l['price'], '確認': "✅ 已確認" if nxt['C'] > curr['C'] else "⏳ 待確認"})
+                        l['expiry'] = i
+        return sigs
+
+    def visualize_and_upload(self, df, symbol, sigs, highs, lows, liq_df):
+        plt.style.use('dark_background')
+        plot_df = df.tail(300).copy().reset_index(drop=True)
+        time_to_idx = {t: i for i, t in enumerate(plot_df['Time'])}
+        x_range = np.arange(len(plot_df))
+
+        # 計算指標
+        exp1, exp2 = plot_df['C'].ewm(span=12).mean(), plot_df['C'].ewm(span=26).mean()
+        macd_line, signal_line = exp1 - exp2, (exp1 - exp2).ewm(span=9).mean()
+        hist = macd_line - signal_line
+        
+        fig, (ax1, ax3, ax2) = plt.subplots(3, 1, figsize=(15, 12), sharex=True, gridspec_kw={'height_ratios': [3, 1.2, 1]})
+        ax1.vlines(x_range, plot_df['L'], plot_df['H'], color='#ffffff', alpha=0.3)
+        ax1.plot(x_range, plot_df['C'], color='#ffffff', alpha=0.9, linewidth=1.2)
+
+        # 標記高低點與信號
+        for h in highs:
+            if h['time'] in time_to_idx:
+                ax1.hlines(h['price'], xmin=time_to_idx[h['time']], xmax=len(plot_df)-1, color='#ef4444', ls='--', alpha=0.5)
+        for l in lows:
+            if l['time'] in time_to_idx:
+                ax1.hlines(l['price'], xmin=time_to_idx[l['time']], xmax=len(plot_df)-1, color='#22c55e', ls='--', alpha=0.5)
+
+        sig_types = []
+        for s in sigs:
+            if s['時間'] in time_to_idx:
+                idx = time_to_idx[s['時間']]
+                is_short = '看空' in s['信號']
+                sig_types.append(s['信號'])
+                ax1.scatter(idx, plot_df.loc[idx, 'H' if is_short else 'L'], s=350, edgecolors='#fbbf24', facecolors='none', linewidth=2)
+                for ax in [ax1, ax3, ax2]: ax.axvline(x=idx, color='#fbbf24', linestyle='--', alpha=0.5)
+
+        # 強平柱狀圖
+        ax3.set_facecolor('#0f172a')
+        ax2.bar(x_range, hist, color=['#00ff88' if x >= 0 else '#ff4444' for x in hist], alpha=0.5)
+        
+        plt.suptitle(f"{symbol} 結構獵殺分析", color='white', fontsize=16)
+        self.upload_plot_to_discord(fig, symbol, ", ".join(list(set(sig_types))))
+        plt.close(fig)
+
+if __name__ == "__main__":
+    hunter = BingXStructureHunterV37()
+    if hunter.get_bingx_symbols(500):
+        print(f"🔍 開始掃描 {len(hunter.targets)} 個交易對...")
+        for s in tqdm(hunter.targets):
+            df = hunter.fetch_data_stable(s, '1h')
+            if df is not None and len(df) > 200:
+                h, l = hunter.find_swing_points(df, 100)
+                sigs = hunter.process_liquidity_logic(df, h, l)
+                if sigs:
+                    liq_df = hunter.fetch_liquidation_data(s)
+                    hunter.visualize_and_upload(df, s, sigs, h, l, liq_df)
+    print("✅ 掃描任務完成")
